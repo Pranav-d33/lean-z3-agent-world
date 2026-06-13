@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.lean.aux
+lean/PlanVerifier.lean
+plans/*.json
+.env
+.venv/
+venv/
