@@ -13,9 +13,27 @@ import argparse
 import sys
 import os
 
-from .world_model import WorldState, goal_door_unlocked, plan_to_json
+from .world_model import WorldState, goal_door_unlocked, plan_to_json, demo
 from .z3_planner import Z3Planner
 from .lean_verifier import LeanVerifier
+
+
+def _pick_viable_outcome(state, action, remaining_plan):
+    results = state.apply_action(action)
+    if not results:
+        return None
+    if not remaining_plan:
+        return results[0]
+    for outcome in results:
+        if _can_complete(outcome, remaining_plan):
+            return outcome
+    return results[0]
+
+def _can_complete(state, plan):
+    if not plan:
+        return True
+    results = state.apply_action(plan[0])
+    return any(_can_complete(r, plan[1:]) for r in results)
 
 
 def run_cli_demo():
@@ -24,9 +42,10 @@ def run_cli_demo():
     print("Certified SMT Planner — CLI Demo")
     print("=" * 60)
 
-    world = WorldState.demo()
+    world = demo()
     print(f"\nInitial state:")
-    print(f"  Agent: ({world.agent_pos.x}, {world.agent_pos.y})")
+    print(f"  Agent A: ({world.agent_a_pos.x}, {world.agent_a_pos.y})")
+    print(f"  Agent B: ({world.agent_b_pos.x}, {world.agent_b_pos.y})")
     print(f"  Key:   ({world.key_pos.x}, {world.key_pos.y})")
     print(f"  Door:  ({world.door_pos.x}, {world.door_pos.y}) (locked)")
     print(f"  Grid:  {world.grid_size}\u00d7{world.grid_size}")
@@ -37,7 +56,7 @@ def run_cli_demo():
     print(f"\n  Goal: door unlocked")
 
     print(f"\n--- Finding Plan ---")
-    planner = Z3Planner(max_horizon=8)
+    planner = Z3Planner(max_horizon=12)
     plan = planner.find_plan(world, goal_door_unlocked)
 
     if plan is None:
@@ -57,15 +76,15 @@ def run_cli_demo():
         print(f"\nExecution trace (one possible path):")
         state = world
         for i, action in enumerate(plan, 1):
-            results = state.apply_action(action)
-            if not results:
+            outcome = _pick_viable_outcome(state, action, plan[i:])
+            if outcome is None:
                 print(f"  ❌ Step {i}: {action} — FAILED (precondition violated)")
                 sys.exit(1)
-            result = results[0]
-            print(f"  {i:2d}. {str(action):20s} \u2192 ({result.agent_pos.x},{result.agent_pos.y}), "
-                  f"key={'✓' if result.has_key else '✗'}, "
-                  f"door={'✓' if result.door_unlocked else '✗'}")
-            state = result
+            print(f"  {i:2d}. {str(action):30s} → A=({outcome.agent_a_pos.x},{outcome.agent_a_pos.y}) "
+                  f"B=({outcome.agent_b_pos.x},{outcome.agent_b_pos.y}) "
+                  f"key={outcome.key_holder}, "
+                  f"door={'✓' if outcome.door_unlocked else '✗'}")
+            state = outcome
         print(f"\n  Goal achieved!")
     else:
         print(f"  ❌ Verification failed")

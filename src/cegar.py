@@ -11,7 +11,7 @@ import logging
 from typing import List, Callable, Optional, Tuple
 
 from .world_model import WorldState, Action, ACTION_MOVE, ACTION_MOVE_CAREFULLY
-from .z3_planner import Z3Planner, encode_goal
+from .z3_planner import Z3Planner
 from .lean_verifier import LeanVerifier
 
 logger = logging.getLogger(__name__)

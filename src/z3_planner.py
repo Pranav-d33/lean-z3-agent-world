@@ -1,45 +1,39 @@
-"""
-Z3 bounded-horizon planner for the grid-world agent.
-
-Uses iterative deepening: tries horizons 1..max_horizon and returns
-the shortest plan found. Encodes the problem using the z3 Python API
-with quantifier-free linear integer arithmetic (QF_LIA) + Booleans.
-"""
-
 from __future__ import annotations
 from typing import List, Callable, Optional
 import logging
 
-from z3 import Int, Bool, Solver, And, Or, Not, Implies, If, sat, Sum  # type: ignore
+from z3 import Int, Bool, Solver, And, Or, Not, Implies, sat
 
 from .world_model import (
     WorldState, Position, Action,
     ACTION_MOVE, ACTION_PICKUP_KEY, ACTION_UNLOCK_DOOR, ACTION_OPEN_DOOR,
-    ACTION_TRY_UNLOCK, ACTION_MOVE_CAREFULLY,
+    ACTION_TRY_UNLOCK, ACTION_MOVE_CAREFULLY, ACTION_PASS_ITEM,
     MOVE_DIRECTIONS, goal_door_unlocked, goal_at_door_and_unlocked,
 )
 
 logger = logging.getLogger(__name__)
 
-# Action type encoding
 AT_MOVE = 0
 AT_PICKUP_KEY = 1
 AT_UNLOCK_DOOR = 2
 AT_OPEN_DOOR = 3
 AT_TRY_UNLOCK = 4
 AT_MOVE_CAREFULLY = 5
+AT_PASS_ITEM = 6
 
 ACTION_NAMES = {
     AT_MOVE: ACTION_MOVE, AT_PICKUP_KEY: ACTION_PICKUP_KEY,
     AT_UNLOCK_DOOR: ACTION_UNLOCK_DOOR, AT_OPEN_DOOR: ACTION_OPEN_DOOR,
     AT_TRY_UNLOCK: ACTION_TRY_UNLOCK, AT_MOVE_CAREFULLY: ACTION_MOVE_CAREFULLY,
+    AT_PASS_ITEM: ACTION_PASS_ITEM,
 }
+
+AGENTS = ["A", "B"]
+AGENT_INDICES = [("A", 0), ("B", 1)]
 
 
 class Z3Planner:
-    """Bounded-horizon Z3 planner with iterative deepening."""
-
-    def __init__(self, max_horizon: int = 8):
+    def __init__(self, max_horizon: int = 20):
         self.max_horizon = max_horizon
 
     def find_plan(
@@ -47,17 +41,12 @@ class Z3Planner:
         initial_state: WorldState,
         goal_condition: Callable[[WorldState], bool],
     ) -> List[Action] | None:
-        """Try horizons from 1 to max_horizon, return the shortest plan.
-
-        Returns list of Action on success, None if unsat.
-        """
         for horizon in range(1, self.max_horizon + 1):
             logger.info(f"Trying horizon = {horizon}")
             plan = self._solve(initial_state, goal_condition, horizon)
             if plan is not None:
                 logger.info(f"Plan found at horizon {horizon}")
                 return plan
-        logger.info("No plan found within max horizon")
         return None
 
     def _solve(
@@ -70,222 +59,191 @@ class Z3Planner:
         obstacles = initial_state.obstacles
         key_pos = initial_state.key_pos
         door_pos = initial_state.door_pos
+        init_a = initial_state.agent_a_pos
+        init_b = initial_state.agent_b_pos
 
         solver = Solver()
 
-        # --- State variables ---
-        x = [Int(f"x_{t}") for t in range(horizon + 1)]
-        y = [Int(f"y_{t}") for t in range(horizon + 1)]
-        has_key = [Bool(f"has_key_{t}") for t in range(horizon + 1)]
-        door_unlocked = [Bool(f"door_unlocked_{t}") for t in range(horizon + 1)]
+        ax = [Int(f"ax_{t}") for t in range(horizon + 1)]
+        ay = [Int(f"ay_{t}") for t in range(horizon + 1)]
+        bx = [Int(f"bx_{t}") for t in range(horizon + 1)]
+        by = [Int(f"by_{t}") for t in range(horizon + 1)]
+        ha = [Bool(f"ha_{t}") for t in range(horizon + 1)]
+        hb = [Bool(f"hb_{t}") for t in range(horizon + 1)]
+        du = [Bool(f"du_{t}") for t in range(horizon + 1)]
 
-        # --- Action variables ---
-        action_type = [Int(f"act_{t}") for t in range(horizon)]
-        dx_var = [Int(f"dx_{t}") for t in range(horizon)]
-        dy_var = [Int(f"dy_{t}") for t in range(horizon)]
+        wh = [Int(f"wh_{t}") for t in range(horizon)]
+        at = [Int(f"at_{t}") for t in range(horizon)]
+        di = [Int(f"dx_{t}") for t in range(horizon)]
+        dj = [Int(f"dy_{t}") for t in range(horizon)]
 
-        # --- Initial state ---
-        solver.add(x[0] == initial_state.agent_pos.x)
-        solver.add(y[0] == initial_state.agent_pos.y)
-        solver.add(has_key[0] == initial_state.has_key)
-        solver.add(door_unlocked[0] == initial_state.door_unlocked)
+        solver.add(ax[0] == init_a.x)
+        solver.add(ay[0] == init_a.y)
+        solver.add(bx[0] == init_b.x)
+        solver.add(by[0] == init_b.y)
+        solver.add(ha[0] == (initial_state.key_holder == "A"))
+        solver.add(hb[0] == (initial_state.key_holder == "B"))
+        solver.add(du[0] == initial_state.door_unlocked)
 
-        # --- State bounds (grid boundaries) ---
         for t in range(horizon + 1):
-            solver.add(x[t] >= 0)
-            solver.add(x[t] < gs)
-            solver.add(y[t] >= 0)
-            solver.add(y[t] < gs)
+            solver.add(And(ax[t] >= 0, ax[t] < gs, ay[t] >= 0, ay[t] < gs))
+            solver.add(And(bx[t] >= 0, bx[t] < gs, by[t] >= 0, by[t] < gs))
+            solver.add(Or(ax[t] != bx[t], ay[t] != by[t]))
+            solver.add(Not(And(ha[t], hb[t])))
 
-        # --- Action type constraints ---
         for t in range(horizon):
-            solver.add(
-                Or(action_type[t] == AT_MOVE,
-                   action_type[t] == AT_PICKUP_KEY,
-                   action_type[t] == AT_UNLOCK_DOOR,
-                   action_type[t] == AT_OPEN_DOOR,
-                   action_type[t] == AT_TRY_UNLOCK,
-                   action_type[t] == AT_MOVE_CAREFULLY)
-            )
+            solver.add(Or(wh[t] == 0, wh[t] == 1))
+            solver.add(Or(*[at[t] == v for v in ACTION_NAMES]))
+            solver.add(Implies(Or(at[t] == AT_MOVE, at[t] == AT_MOVE_CAREFULLY), Or(
+                And(di[t] == -1, dj[t] == 0), And(di[t] == 1, dj[t] == 0),
+                And(di[t] == 0, dj[t] == -1), And(di[t] == 0, dj[t] == 1),
+            )))
+            # Agent capability constraints
+            for w, who_idx in AGENT_INDICES:
+                if not initial_state.can_pickup.get(w, True):
+                    solver.add(Not(And(wh[t] == who_idx, at[t] == AT_PICKUP_KEY)))
+                if not initial_state.can_unlock.get(w, True):
+                    solver.add(Not(And(wh[t] == who_idx, Or(at[t] == AT_UNLOCK_DOOR, at[t] == AT_TRY_UNLOCK))))
 
-        # --- Movement direction constraints (for Move, MoveCarefully) ---
+        def agent_pos(who, t):
+            return (ax[t], ay[t], ax[t+1], ay[t+1]) if who == "A" else (bx[t], by[t], bx[t+1], by[t+1])
+
+        def other_pos(who, t):
+            return (bx[t], by[t], bx[t+1], by[t+1]) if who == "A" else (ax[t], ay[t], ax[t+1], ay[t+1])
+
+        def is_who(who, t):
+            return wh[t] == (0 if who == "A" else 1)
+
+        def h_self(who, t):
+            return ha[t] if who == "A" else hb[t]
+
+        def h_self1(who):
+            return ha if who == "A" else hb
+
+        def h_other(who, t):
+            return hb[t] if who == "A" else ha[t]
+
+        def h_other1(who):
+            return hb if who == "A" else ha
+
         for t in range(horizon):
-            move = Or(action_type[t] == AT_MOVE, action_type[t] == AT_MOVE_CAREFULLY)
-            solver.add(Implies(move, Or(
-                And(dx_var[t] == -1, dy_var[t] == 0),
-                And(dx_var[t] == 1,  dy_var[t] == 0),
-                And(dx_var[t] == 0,  dy_var[t] == -1),
-                And(dx_var[t] == 0,  dy_var[t] == 1),
-            )))
+            for w in AGENTS:
+                ox, oy, ox1, oy1 = other_pos(w, t)
+                solver.add(Implies(is_who(w, t), And(
+                    ox1 == ox, oy1 == oy,
+                    Implies(at[t] != AT_PASS_ITEM, h_other1(w)[t+1] == h_other(w, t)),
+                )))
+            # Default key-frame for active agent (overridden by pickup/pass/try)
+            no_key_change = And(at[t] != AT_PICKUP_KEY, at[t] != AT_TRY_UNLOCK, at[t] != AT_PASS_ITEM)
+            for w in AGENTS:
+                solver.add(Implies(And(is_who(w, t), no_key_change),
+                                   h_self1(w)[t+1] == h_self(w, t)))
 
-        # --- Transition constraints ---
-        for t in range(horizon):
-            move = action_type[t] == AT_MOVE
-            pickup = action_type[t] == AT_PICKUP_KEY
-            unlock = action_type[t] == AT_UNLOCK_DOOR
-            open_door = action_type[t] == AT_OPEN_DOOR
-            try_unlock = action_type[t] == AT_TRY_UNLOCK
-            move_carefully = action_type[t] == AT_MOVE_CAREFULLY
-
-            new_x = x[t] + dx_var[t]
-            new_y = y[t] + dy_var[t]
-            in_bounds = And(new_x >= 0, new_x < gs, new_y >= 0, new_y < gs)
-
-            not_obstacle = True
-            for ox, oy in obstacles:
-                not_obstacle = And(not_obstacle, Not(And(new_x == ox, new_y == oy)))
-
-            # Move: precondition = new pos in bounds & not obstacle
-            solver.add(Implies(move, And(
-                in_bounds,
-                not_obstacle,
-                x[t + 1] == new_x,
-                y[t + 1] == new_y,
-                has_key[t + 1] == has_key[t],
-                door_unlocked[t + 1] == door_unlocked[t],
-            )))
-
-            # PickupKey: precondition = at key position, key not yet picked
-            solver.add(Implies(pickup, And(
-                x[t] == key_pos.x,
-                y[t] == key_pos.y,
-                Not(has_key[t]),
-                x[t + 1] == x[t],
-                y[t + 1] == y[t],
-                has_key[t + 1] == True,
-                door_unlocked[t + 1] == door_unlocked[t],
-            )))
-
-            # UnlockDoor: precondition = at door, has key, door still locked
-            solver.add(Implies(unlock, And(
-                x[t] == door_pos.x,
-                y[t] == door_pos.y,
-                has_key[t],
-                Not(door_unlocked[t]),
-                x[t + 1] == x[t],
-                y[t + 1] == y[t],
-                has_key[t + 1] == has_key[t],
-                door_unlocked[t + 1] == True,
-            )))
-
-            # OpenDoor: precondition = at door, door is unlocked
-            solver.add(Implies(open_door, And(
-                x[t] == door_pos.x,
-                y[t] == door_pos.y,
-                door_unlocked[t],
-                x[t + 1] == x[t],
-                y[t + 1] == y[t],
-                has_key[t + 1] == has_key[t],
-                door_unlocked[t + 1] == door_unlocked[t],
-            )))
-
-            # TryUnlock: precondition = at door, has key
-            # Non-deterministic: success (door opens) OR failure (key breaks)
-            solver.add(Implies(try_unlock, And(
-                x[t] == door_pos.x,
-                y[t] == door_pos.y,
-                has_key[t],
-                x[t + 1] == x[t],
-                y[t + 1] == y[t],
-                Or(
-                    And(door_unlocked[t + 1] == True, has_key[t + 1] == has_key[t]),
-                    And(door_unlocked[t + 1] == door_unlocked[t], has_key[t + 1] == False),
-                ),
-            )))
-
-            # MoveCarefully: precondition = target is free
-            # Non-deterministic: reach target OR slip to adjacent free cell
-            slip_conditions = []
-            for sd_x, sd_y in MOVE_DIRECTIONS:
-                slip_to_x = x[t] + sd_x
-                slip_to_y = y[t] + sd_y
-                slip_free = And(slip_to_x >= 0, slip_to_x < gs,
-                                slip_to_y >= 0, slip_to_y < gs)
+            for w in AGENTS:
+                cx, cy, nx, ny = agent_pos(w, t)
+                a = And(is_who(w, t), at[t] == AT_MOVE)
+                nobs = True
                 for ox, oy in obstacles:
-                    slip_free = And(slip_free, Not(And(slip_to_x == ox, slip_to_y == oy)))
-                slip_not_target = Not(And(slip_to_x == new_x, slip_to_y == new_y))
-                slip_conditions.append(And(slip_free, slip_not_target,
-                                           x[t + 1] == slip_to_x, y[t + 1] == slip_to_y))
+                    nobs = And(nobs, Not(And(cx + di[t] == ox, cy + dj[t] == oy)))
+                solver.add(Implies(a, And(
+                    cx + di[t] >= 0, cx + di[t] < gs,
+                    cy + dj[t] >= 0, cy + dj[t] < gs,
+                    nobs,
+                    nx == cx + di[t], ny == cy + dj[t],
+                    du[t + 1] == du[t],
+                )))
 
-            solver.add(Implies(move_carefully, And(
-                in_bounds,
-                not_obstacle,
-                Or(
-                    And(x[t + 1] == new_x, y[t + 1] == new_y),
-                    *slip_conditions,
-                ),
-                has_key[t + 1] == has_key[t],
-                door_unlocked[t + 1] == door_unlocked[t],
-            )))
+                a = And(is_who(w, t), at[t] == AT_PICKUP_KEY)
+                solver.add(Implies(a, And(
+                    cx == key_pos.x, cy == key_pos.y,
+                    Not(h_self(w, t)), Not(ha[t]), Not(hb[t]),
+                    nx == cx, ny == cy,
+                    h_self1(w)[t + 1] == True,
+                    du[t + 1] == du[t],
+                )))
 
-        # --- Goal condition at final step ---
-        goal_exprs = encode_goal(
-            goal_condition, door_pos,
-            x[horizon], y[horizon],
-            has_key[horizon], door_unlocked[horizon],
-        )
-        solver.add(And(*goal_exprs))
+                a = And(is_who(w, t), at[t] == AT_UNLOCK_DOOR)
+                solver.add(Implies(a, And(
+                    cx == door_pos.x, cy == door_pos.y,
+                    h_self(w, t), Not(du[t]),
+                    nx == cx, ny == cy,
+                    du[t + 1] == True,
+                )))
 
-        # --- Solve ---
+                a = And(is_who(w, t), at[t] == AT_OPEN_DOOR)
+                solver.add(Implies(a, And(
+                    cx == door_pos.x, cy == door_pos.y, du[t],
+                    nx == cx, ny == cy,
+                    du[t + 1] == du[t],
+                )))
+
+                a = And(is_who(w, t), at[t] == AT_TRY_UNLOCK)
+                solver.add(Implies(a, And(
+                    cx == door_pos.x, cy == door_pos.y,
+                    h_self(w, t),
+                    nx == cx, ny == cy,
+                    Or(
+                        And(du[t + 1] == True, h_self1(w)[t + 1] == h_self(w, t)),
+                        And(du[t + 1] == du[t], h_self1(w)[t + 1] == False),
+                    ),
+                )))
+
+                a = And(is_who(w, t), at[t] == AT_MOVE_CAREFULLY)
+                nobs = True
+                for ox, oy in obstacles:
+                    nobs = And(nobs, Not(And(cx + di[t] == ox, cy + dj[t] == oy)))
+                solver.add(Implies(a, And(
+                    cx + di[t] >= 0, cx + di[t] < gs,
+                    cy + dj[t] >= 0, cy + dj[t] < gs,
+                    nobs,
+                    nx == cx + di[t], ny == cy + dj[t],
+                    du[t + 1] == du[t],
+                )))
+
+                act = And(is_who(w, t), at[t] == AT_PASS_ITEM)
+                ox, oy, _, _ = other_pos(w, t)
+                adj = Or(
+                    And(ox == cx + 1, oy == cy),
+                    And(ox == cx - 1, oy == cy),
+                    And(ox == cx, oy == cy + 1),
+                    And(ox == cx, oy == cy - 1),
+                )
+                solver.add(Implies(act, And(
+                    h_self(w, t), adj,
+                    nx == cx, ny == cy,
+                    h_self1(w)[t + 1] == False,
+                    h_other1(w)[t + 1] == True,
+                    du[t + 1] == du[t],
+                )))
+
+        # Goal
+        if goal_condition is goal_door_unlocked:
+            solver.add(du[horizon] == True)
+        elif goal_condition is goal_at_door_and_unlocked:
+            solver.add(du[horizon] == True)
+            solver.add(Or(
+                And(ax[horizon] == door_pos.x, ay[horizon] == door_pos.y),
+                And(bx[horizon] == door_pos.x, by[horizon] == door_pos.y),
+            ))
+        else:
+            raise ValueError(f"Unknown goal function: {goal_condition.__name__}")
+
         if solver.check() == sat:
             model = solver.model()
-            return self._extract_plan(model, horizon, action_type, dx_var, dy_var)
-
+            return self._extract_plan(model, horizon, wh, at, di, dj)
         return None
 
-    def _action_type_id(self, action: Action) -> int:
-        for tid, name in ACTION_NAMES.items():
-            if name == action.type:
-                return tid
-        return AT_MOVE
-
-    def _extract_plan(
-        self,
-        model,
-        horizon: int,
-        action_type,
-        dx_var,
-        dy_var,
-    ) -> List[Action]:
+    def _extract_plan(self, model, horizon, wh, at, di, dj) -> List[Action]:
         plan: List[Action] = []
         for t in range(horizon):
-            at = model.eval(action_type[t]).as_long()
-            action_name = ACTION_NAMES.get(at)
-            if action_name is None:
-                logger.warning(f"Unknown action type {at} at step {t}, skipping")
+            which = "A" if model.eval(wh[t]).as_long() == 0 else "B"
+            av = model.eval(at[t]).as_long()
+            name = ACTION_NAMES.get(av)
+            if name is None:
                 continue
-
-            if action_name in (ACTION_MOVE, ACTION_MOVE_CAREFULLY):
-                dx = model.eval(dx_var[t]).as_long()
-                dy = model.eval(dy_var[t]).as_long()
-                plan.append(Action(action_name, dx=dx, dy=dy))
+            if name in (ACTION_MOVE, ACTION_MOVE_CAREFULLY):
+                plan.append(Action(name, agent=which, dx=model.eval(di[t]).as_long(),
+                                   dy=model.eval(dj[t]).as_long()))
             else:
-                plan.append(Action(action_name))
-
+                plan.append(Action(name, agent=which))
         return plan
-
-
-def encode_goal(
-    goal_fn: Callable[[WorldState], bool],
-    door_pos: Position,
-    x_expr,
-    y_expr,
-    has_key_expr,
-    door_unlocked_expr,
-):
-    """Encode a goal predicate as Z3 constraints.
-
-    Maps Python goal functions that operate on WorldState to Z3 expressions
-    over the final-step state variables.
-    """
-    if goal_fn is goal_door_unlocked:
-        return [door_unlocked_expr == True]
-
-    if goal_fn is goal_at_door_and_unlocked:
-        return [
-            door_unlocked_expr == True,
-            x_expr == door_pos.x,
-            y_expr == door_pos.y,
-        ]
-
-    raise ValueError(f"Unknown goal function: {goal_fn.__name__}")
